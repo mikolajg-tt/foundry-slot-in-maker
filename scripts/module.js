@@ -288,17 +288,48 @@ class SessionForm extends FormApplication {
         const regex = /\[(.*?)\]\((.*?)\)/g;
         let match;
         let processedLine = line;
-        while ((match = regex.exec(line)) !== null) {
-            const text = await this.getSingularForm(match[1]);
-            const [item] = await game.packs.get("pf2e.equipment-srd").getDocuments({ name: text });
-            const [spell] = await game.packs.get("pf2e.spells-srd").getDocuments({ name: text });
+        const findByName = async (name) => {
+            const [item] = await game.packs.get("pf2e.equipment-srd").getDocuments({ name });
+            const [spell] = await game.packs.get("pf2e.spells-srd").getDocuments({ name });
             let monster;
             if (!item && !spell) {
-                monster = await this.findMonsterPathfinder(text);
+                monster = await this.findMonsterPathfinder(name);
             }
-            processedLine = await this.createJournalItem(match, text, item, spell, monster, processedLine, itemFolder, monsterFolder, modulePath);
+            return { item, spell, monster };
+        };
+        while ((match = regex.exec(line)) !== null) {
+            const originalText = match[1];
+            let text = originalText;
+            let { item, spell, monster } = await findByName(text);
+            if (!item && !spell && !monster) {
+                const singularText = await this.getSingularForm(originalText);
+                const found = await findByName(singularText);
 
+                if (found.item || found.spell || found.monster) {
+                    text = singularText;
+                    item = found.item;
+                    spell = found.spell;
+                    monster = found.monster;
+                } else {
+                    text = originalText;
+                    item = undefined;
+                    spell = undefined;
+                    monster = undefined;
+                }
+            }
+            processedLine = await this.createJournalItem(
+                match,
+                text,
+                item,
+                spell,
+                monster,
+                processedLine,
+                itemFolder,
+                monsterFolder,
+                modulePath
+            );
         }
+
         return processedLine.replace('  ', ' ');
     }
 
