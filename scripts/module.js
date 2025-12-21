@@ -214,62 +214,6 @@ class SessionForm extends FormApplication {
         return text;
     }
 
-    async createJournalItem(match, text, item, spell, monster, processedLine, itemFolder, monsterFolder, modulePath) {
-        const entity = item || spell || monster;
-        if (entity) {
-            if (item || spell) {
-                let entityType = entity.type.charAt(0).toUpperCase() + entity.type.slice(1);
-                let subfolder = await game.folders.find(f => f.name === entityType && f.type === "Item" && f.folder?.id === itemFolder.id);
-                if (!subfolder) {
-                    subfolder = await Folder.create({ name: entityType, type: "Item", folder: itemFolder.id });
-                }
-                let entityData = entity.toObject();
-                entityData.folder = subfolder.id;
-                let importedEntity;
-                if (!game.items.find(f => f.name === text)) {
-                    importedEntity = await Item.create(entityData);
-                }
-                else {
-                    importedEntity = game.items.find(f => f.name === text);
-                }
-                let entityId = importedEntity.id;
-                processedLine = processedLine.replace(match[0], ` @UUID[Item.${entityId}]{${text}} `);
-            } else if (monster) {
-                let monsterData = monster.toObject();
-                monsterData.folder = monsterFolder.id;
-                let importedMonster;
-                if (!game.actors.find(f => f.name === text)) {
-                    importedMonster = await Actor.create(monsterData);
-                    if (modulePath) {
-                        await this.createToken(importedMonster, text, modulePath)
-                    }
-                }
-                else {
-                    importedMonster = game.actors.find(f => f.name === text);
-                }
-                let monsterId = importedMonster.id;
-                processedLine = processedLine.replace(match[0], ` @UUID[Actor.${monsterId}]{${text}} `);
-            }
-        } else {
-            processedLine = processedLine.replace(match[0], text);
-        }
-        return processedLine;
-    }
-
-    async processJournalItems(line, monsterFolder, itemFolder) {
-        const regex = /\[(.*?)\]\((.*?)\)/g;
-        let match;
-        let processedLine = line;
-        while ((match = regex.exec(line)) !== null) {
-            const text = await this.getSingularForm(match[1]);
-            const [item] = await game.packs.get("dnd5e.items").getDocuments({ name: text });
-            const [spell] = await game.packs.get("dnd5e.spells").getDocuments({ name: text });
-            const [monster] = await game.packs.get("dnd5e.monsters").getDocuments({ name: text });
-            processedLine = await this.createJournalItem(match, text, item, spell, monster, processedLine, itemFolder, monsterFolder)
-        }
-        return processedLine.replace('  ', ' ');
-    }
-
     async findMonsterPathfinder(text) {
         let monster = null;
         for (const pack of game.packs.keys()) {
@@ -282,55 +226,6 @@ class SessionForm extends FormApplication {
             }
         }
         return monster;
-    }
-
-    async processJournalItemsPathfinder(line, monsterFolder, itemFolder, modulePath) {
-        const regex = /\[(.*?)\]\((.*?)\)/g;
-        let match;
-        let processedLine = line;
-        const findByName = async (name) => {
-            const [item] = await game.packs.get("pf2e.equipment-srd").getDocuments({ name });
-            const [spell] = await game.packs.get("pf2e.spells-srd").getDocuments({ name });
-            let monster;
-            if (!item && !spell) {
-                monster = await this.findMonsterPathfinder(name);
-            }
-            return { item, spell, monster };
-        };
-        while ((match = regex.exec(line)) !== null) {
-            const originalText = match[1];
-            let text = originalText;
-            let { item, spell, monster } = await findByName(text);
-            if (!item && !spell && !monster) {
-                const singularText = await this.getSingularForm(originalText);
-                const found = await findByName(singularText);
-
-                if (found.item || found.spell || found.monster) {
-                    text = singularText;
-                    item = found.item;
-                    spell = found.spell;
-                    monster = found.monster;
-                } else {
-                    text = originalText;
-                    item = undefined;
-                    spell = undefined;
-                    monster = undefined;
-                }
-            }
-            processedLine = await this.createJournalItem(
-                match,
-                text,
-                item,
-                spell,
-                monster,
-                processedLine,
-                itemFolder,
-                monsterFolder,
-                modulePath
-            );
-        }
-
-        return processedLine.replace('  ', ' ');
     }
 
     async addMusic(name, content, macro, musicList) {
@@ -349,116 +244,753 @@ class SessionForm extends FormApplication {
         return content;
     }
 
-    async processJournals(journals, folder, monsters, monsterFolder, itemFolder, macro, musicList) {
-        journals = journals.join('\n').split('\n')
-        const mainJournal = await JournalEntry.create({
-            name: 'Dungeon Design',
-            folder: folder.id
+    async getPackIndex(pack) {
+        this._mrIndexCache ??= new Map();
+        if (this._mrIndexCache.has(pack.collection)) return this._mrIndexCache.get(pack.collection);
+        const idx = await pack.getIndex({ fields: ["name"] });
+        this._mrIndexCache.set(pack.collection, idx);
+        return idx;
+    }
+
+    async getAllNameEntries(documentName) {
+        this._mrNameCache ??= {};
+        if (this._mrNameCache[documentName]) return this._mrNameCache[documentName];
+
+        const packs = Array.from(game.packs.values()).filter(p => p.documentName === documentName);
+        const all = [];
+
+        for (const pack of packs) {
+            const idx = await this.getPackIndex(pack);
+            for (const e of idx) {
+                const name = e.name ?? "";
+                all.push({
+                    packCollection: pack.collection,
+                    packTitle: pack.title,
+                    id: e._id,
+                    name,
+                    nameLower: name.toLowerCase()
+                });
+            }
+        }
+
+        this._mrNameCache[documentName] = all;
+        return all;
+    }
+
+    async getDocHaystack(pack, id) {
+        this._mrDocTextCache ??= new Map();
+        const key = `${pack.collection}:${id}`;
+        if (this._mrDocTextCache.has(key)) return this._mrDocTextCache.get(key);
+
+        const doc = await pack.getDocument(id);
+        let hay = "";
+        if (doc) {
+            try {
+                hay = JSON.stringify(doc.toObject()) ?? "";
+            } catch (e) {
+                hay = `${doc.name ?? ""}`;
+            }
+        }
+        hay = hay.toLowerCase();
+        if (hay.length > 90000) hay = hay.slice(0, 90000);
+        this._mrDocTextCache.set(key, hay);
+        return hay;
+    }
+
+    scoreName(name, q) {
+        const n = (name ?? "").trim().toLowerCase();
+        if (!n) return 999;
+        if (n === q) return 0;
+        if (n.startsWith(q)) return 1;
+        if (n.includes(q)) return 2;
+        return 10;
+    }
+
+    async searchCompendiumContent(documentName, query, limit = 10) {
+        const q = (query ?? "").trim().toLowerCase();
+        if (!q) return [];
+
+        this._mrLast ??= {};
+        const last = this._mrLast[documentName] ?? { q: "", candidates: null };
+
+        const all = await this.getAllNameEntries(documentName);
+        let base = all;
+
+        if (last.candidates && q.startsWith(last.q)) {
+            base = last.candidates;
+        }
+
+        const candidates = [];
+        const seenNames = new Set();
+
+        for (const e of base) {
+            if (!e.nameLower.includes(q)) continue;
+            const key = (e.nameLower || "").trim();
+            if (!key) continue;
+            if (seenNames.has(key)) continue;
+            seenNames.add(key);
+            candidates.push(e);
+        }
+
+        this._mrLast[documentName] = { q, candidates };
+
+        candidates.sort((a, b) => (this.scoreName(a.name, q) - this.scoreName(b.name, q)) || a.name.localeCompare(b.name));
+
+        const quick = candidates.slice(0, limit).map(c => ({
+            packCollection: c.packCollection,
+            packTitle: c.packTitle,
+            id: c.id,
+            name: c.name
+        }));
+
+        if (quick.length) return quick;
+        if (q.length < limit) return quick;
+
+        const packs = Array.from(game.packs.values()).filter(p => p.documentName === documentName);
+        const results = [];
+        const maxChecks = 120;
+        let checked = 0;
+
+        for (const pack of packs) {
+            const idx = await this.getPackIndex(pack);
+            for (const e of idx) {
+                const hay = await this.getDocHaystack(pack, e._id);
+                checked += 1;
+                if (hay.includes(q)) {
+                    results.push({
+                        packCollection: pack.collection,
+                        packTitle: pack.title,
+                        id: e._id,
+                        name: e.name ?? ""
+                    });
+                }
+                if (results.length >= limit) return results;
+                if (checked >= maxChecks) return results;
+                if ((checked % 8) === 0) await new Promise(r => setTimeout(r, 0));
+            }
+        }
+
+        return results;
+    }
+
+    async importAndMakeLinkFromEntity(entity, isActor, itemFolder, monsterFolder, modulePath) {
+        const placeholder = `@@TMP_${foundry.utils.randomID()}@@`;
+        const match = [placeholder];
+        const processed = placeholder;
+        const text = entity?.name ?? "";
+
+        return await this.createJournalItem(
+            match,
+            text,
+            isActor ? null : entity,
+            null,
+            isActor ? entity : null,
+            processed,
+            itemFolder,
+            monsterFolder,
+            modulePath
+        );
+    }
+
+    async resolveMissingReferences(entries, missingRefs, itemFolder, monsterFolder, modulePath) {
+        if (!missingRefs.length) return entries;
+
+        const choices = await this.openMissingLinkResolver(missingRefs);
+        const replacementMap = {};
+
+        for (const m of missingRefs) {
+            const choice = choices?.[m.placeholder] ?? null;
+            const type = choice?.type || m.defaultType || "Item";
+            const isActor = type === "Actor";
+
+            let replacement = m.linkText;
+
+            if (choice?.collection && choice?.id) {
+                const pack = game.packs.get(choice.collection);
+                const doc = pack ? await pack.getDocument(choice.id) : null;
+                if (doc) replacement = await this.importAndMakeLinkFromEntity(doc, isActor, itemFolder, monsterFolder, modulePath);
+            }
+
+            replacementMap[m.placeholder] = replacement;
+        }
+
+        for (const [k, v] of Object.entries(entries)) {
+            let content = v;
+            for (const m of missingRefs) {
+                const rep = replacementMap[m.placeholder] ?? m.linkText;
+                content = content.split(m.placeholder).join(rep);
+            }
+            entries[k] = content;
+        }
+
+        return entries;
+    }
+
+    async openMissingLinkResolver(missingRefs) {
+        const escapeHtml = (s) =>
+            String(s)
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll('"', "&quot;")
+                .replaceAll("'", "&#039;");
+
+        const buildContextHtml = (contextLine, linkText) => {
+            const ctx = String(contextLine ?? "");
+            const lt = String(linkText ?? "");
+            if (!ctx) return `<strong>${escapeHtml(lt)}</strong>`;
+
+            const ctxLower = ctx.toLowerCase();
+            const ltLower = lt.toLowerCase();
+            const idx = lt ? ctxLower.indexOf(ltLower) : -1;
+
+            if (idx < 0) return escapeHtml(ctx);
+
+            const before = ctx.slice(0, idx);
+            const match = ctx.slice(idx, idx + lt.length);
+            const after = ctx.slice(idx + lt.length);
+
+            return `${escapeHtml(before)}<strong>${escapeHtml(match)}</strong>${escapeHtml(after)}`;
+        };
+
+        const rows = missingRefs.map(m => {
+            const ph = escapeHtml(m.placeholder);
+            const contextHtml = buildContextHtml(m.contextLine, m.linkText);
+            const isActor = (m.defaultType || "Item") === "Actor";
+
+            return `
+            <tr data-placeholder="${ph}">
+                <td class="mr-text" style="width: 42%; vertical-align: top; padding: 10px; border-bottom: 1px solid #e6e6e6; font-weight: 400; color: #000000; background: #ffffff; cursor: pointer;">
+                    <div class="mr-context" style="padding: 10px; border: 1px solid #d9d9d9; border-radius: 6px; background: #ffffff; color: #000000; white-space: pre-wrap; word-break: break-word;">${contextHtml}</div>
+                </td>
+                <td style="width: 12%; vertical-align: top; padding: 10px; border-bottom: 1px solid #e6e6e6; font-weight: 400; color: #000000; background: #ffffff;">
+                    <select class="mr-type" style="width: 100%; font-weight: 400; color: #000000;">
+                        <option value="Item" ${isActor ? "" : "selected"}>Item</option>
+                        <option value="Actor" ${isActor ? "selected" : ""}>Actor</option>
+                    </select>
+                </td>
+                <td style="width: 46%; vertical-align: top; padding: 10px; border-bottom: 1px solid #e6e6e6; font-weight: 400; color: #000000; background: #ffffff;">
+                    <input class="mr-query" type="text" style="width: 100%; font-weight: 400; color: #000000;" value="" autocomplete="off" />
+                    <input class="mr-picked" type="hidden" value="" />
+                </td>
+            </tr>
+        `;
+        }).join("");
+
+        const content = `
+        <div style="display: flex; flex-direction: column; gap: 10px;">
+            <div class="mr-scroll" style="height: 82vh; overflow: auto; border: 1px solid #cfcfcf; border-radius: 8px; background: #ffffff;">
+                <table style="width: 100%; border-collapse: collapse; font-weight: 400; color: #000000; background: #ffffff; border: none!important;">
+                    <thead style="border: none!important;">
+                        <tr>
+                            <th style="text-align: left; padding: 10px; border-bottom: 1px solid #d9d9d9; position: sticky; top: 0; background: #ffffff; z-index: 2; font-weight: 400; color: #000000; text-shadow: none">Text</th>
+                            <th style="text-align: left; padding: 10px; border-bottom: 1px solid #d9d9d9; position: sticky; top: 0; background: #ffffff; z-index: 2; font-weight: 400; color: #000000; text-shadow: none">Type</th>
+                            <th style="text-align: left; padding: 10px; border-bottom: 1px solid #d9d9d9; position: sticky; top: 0; background: #ffffff; z-index: 2; font-weight: 400; color: #000000; text-shadow: none">Search</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>
+            </div>
+        </div>
+    `;
+
+        const makeDropdown = () => {
+            const dd = document.createElement("div");
+            dd.className = "mr-dd-global";
+            dd.style.position = "fixed";
+            dd.style.display = "none";
+            dd.style.background = "#ffffff";
+            dd.style.border = "1px solid #cfcfcf";
+            dd.style.borderRadius = "6px";
+            dd.style.zIndex = "999999";
+            dd.style.maxHeight = "180px";
+            dd.style.overflow = "auto";
+            dd.style.boxShadow = "0 4px 18px rgba(0,0,0,0.15)";
+            dd.style.color = "#000000";
+            document.body.appendChild(dd);
+            return dd;
+        };
+
+        const positionDropdown = (dd, input) => {
+            const r = input.getBoundingClientRect();
+            dd.style.left = `${Math.round(r.left)}px`;
+            dd.style.top = `${Math.round(r.bottom + 4)}px`;
+            dd.style.width = `${Math.round(r.width)}px`;
+        };
+
+        const hideDropdown = (dd) => {
+            dd.style.display = "none";
+            dd.innerHTML = "";
+            dd._anchor = null;
+        };
+
+        const showDropdown = (dd) => {
+            dd.style.display = "block";
+        };
+
+        const renderDropdown = (dd, hits) => {
+            if (!hits.length) {
+                dd.innerHTML = `<div style="padding: 8px 10px; color: #666666; font-weight: 400;">No matches</div>`;
+                return;
+            }
+
+            dd.innerHTML = hits.map(h => {
+                const val = `${h.packCollection}|${h.id}`;
+                const label = `${h.name} (${h.packTitle})`;
+                return `<div class="mr-opt" data-val="${escapeHtml(val)}" data-name="${escapeHtml(h.name)}" style="padding: 8px 10px; cursor: pointer; font-weight: 400; color: #000000; background: #ffffff;">${escapeHtml(label)}</div>`;
+            }).join("");
+        };
+
+        return await new Promise((resolve) => {
+            let dd;
+
+            const cleanup = () => {
+                if (dd && dd.parentElement) dd.parentElement.removeChild(dd);
+                dd = null;
+            };
+
+            new Dialog(
+                {
+                    title: "Resolve missing references",
+                    content,
+                    render: (html) => {
+                        dd = makeDropdown();
+
+                        const root = html[0];
+                        const tbody = root.querySelector("tbody");
+                        const scrollEl = root.querySelector(".mr-scroll");
+
+                        const debounceMap = new WeakMap();
+
+                        const schedulePopulate = (tr) => {
+                            const existing = debounceMap.get(tr);
+                            if (existing) window.clearTimeout(existing);
+                            const t = window.setTimeout(() => populateRow(tr), 170);
+                            debounceMap.set(tr, t);
+                        };
+
+                        const populateRow = async (tr) => {
+                            const type = tr.querySelector(".mr-type").value;
+                            const input = tr.querySelector(".mr-query");
+                            const picked = tr.querySelector(".mr-picked");
+                            const q = (input.value ?? "").trim();
+
+                            picked.value = "";
+
+                            if (!q) {
+                                hideDropdown(dd);
+                                return;
+                            }
+
+                            dd._anchor = { tr, input };
+                            positionDropdown(dd, input);
+                            renderDropdown(dd, []);
+                            showDropdown(dd);
+
+                            const hits = await this.searchCompendiumContent(type, q, 10);
+                            if (!dd._anchor || dd._anchor.tr !== tr) return;
+
+                            positionDropdown(dd, input);
+                            renderDropdown(dd, hits);
+                            showDropdown(dd);
+                        };
+
+                        const applyPick = (tr, val, name) => {
+                            const input = tr.querySelector(".mr-query");
+                            const picked = tr.querySelector(".mr-picked");
+                            input.value = name || "";
+                            picked.value = val || "";
+                            hideDropdown(dd);
+                        };
+
+                        tbody.addEventListener("input", (ev) => {
+                            const tr = ev.target.closest("tr");
+                            if (!tr) return;
+                            if (ev.target.classList.contains("mr-query")) schedulePopulate(tr);
+                        });
+
+                        tbody.addEventListener("focusin", (ev) => {
+                            const tr = ev.target.closest("tr");
+                            if (!tr) return;
+                            if (ev.target.classList.contains("mr-query")) schedulePopulate(tr);
+                        });
+
+                        tbody.addEventListener("change", (ev) => {
+                            const tr = ev.target.closest("tr");
+                            if (!tr) return;
+
+                            if (ev.target.classList.contains("mr-type")) {
+                                const input = tr.querySelector(".mr-query");
+                                const picked = tr.querySelector(".mr-picked");
+                                input.value = "";
+                                picked.value = "";
+                                hideDropdown(dd);
+                            }
+                        });
+
+                        tbody.addEventListener("click", (ev) => {
+                            const tr = ev.target.closest("tr");
+                            if (!tr) return;
+
+                            if (ev.target.closest(".mr-text")) {
+                                const ph = tr.dataset.placeholder;
+                                const m = missingRefs.find(x => x.placeholder === ph) ?? null;
+                                const htmlCtx = buildContextHtml(m?.contextLine ?? "", m?.linkText ?? "");
+                                new Dialog(
+                                    {
+                                        title: "Context",
+                                        content: `<div style="padding: 6px 0; color: #000000;"><div style="white-space: pre-wrap; word-break: break-word; margin: 0; padding: 10px; border: 1px solid #d9d9d9; border-radius: 6px; background: #ffffff; color: #000000;">${htmlCtx}</div></div>`,
+                                        buttons: { ok: { label: "OK" } },
+                                        default: "ok"
+                                    },
+                                    { width: 1200, height: 450, resizable: true }
+                                ).render(true);
+                                return;
+                            }
+                        });
+
+                        dd.addEventListener("mousemove", (ev) => {
+                            const opt = ev.target.closest(".mr-opt");
+                            if (!opt) return;
+                            for (const child of dd.children) child.style.background = "#ffffff";
+                            opt.style.background = "#f2f2f2";
+                        });
+
+                        dd.addEventListener("mousedown", (ev) => {
+                            const opt = ev.target.closest(".mr-opt");
+                            if (!opt) return;
+                            const anchor = dd._anchor;
+                            if (!anchor?.tr) return;
+                            applyPick(anchor.tr, opt.dataset.val || "", opt.dataset.name || "");
+                        });
+
+                        const repositionIfOpen = () => {
+                            if (!dd._anchor?.input) return;
+                            positionDropdown(dd, dd._anchor.input);
+                        };
+
+                        scrollEl?.addEventListener("scroll", () => {
+                            if (dd.style.display === "none") return;
+                            repositionIfOpen();
+                        });
+
+                        window.addEventListener("scroll", repositionIfOpen, true);
+
+                        root.addEventListener("mousedown", (ev) => {
+                            const inDialog = root.contains(ev.target);
+                            const inDd = dd.contains(ev.target);
+                            if (!inDialog || inDd) return;
+
+                            const inInput = ev.target.closest(".mr-query");
+                            if (inInput) return;
+
+                            hideDropdown(dd);
+                        });
+
+                        root._mrCleanup = () => {
+                            window.removeEventListener("scroll", repositionIfOpen, true);
+                        };
+                    },
+                    buttons: {
+                        apply: {
+                            label: "Apply",
+                            callback: (html) => {
+                                const root = html[0];
+                                const trs = Array.from(root.querySelectorAll("tbody tr"));
+                                const out = {};
+
+                                for (const tr of trs) {
+                                    const placeholder = tr.dataset.placeholder;
+                                    const type = tr.querySelector(".mr-type").value;
+                                    const picked = tr.querySelector(".mr-picked").value || "";
+
+                                    if (picked) {
+                                        const [collection, id] = picked.split("|");
+                                        out[placeholder] = { type, collection, id };
+                                    } else {
+                                        out[placeholder] = { type, collection: null, id: null };
+                                    }
+                                }
+
+                                resolve(out);
+                            }
+                        }
+                    },
+                    default: "apply",
+                    close: (html) => {
+                        try {
+                            const root = html?.[0];
+                            if (root?._mrCleanup) root._mrCleanup();
+                        } catch (e) {}
+                        cleanup();
+                        resolve(null);
+                    }
+                },
+                { width: 2100, height: 1200, resizable: true }
+            ).render(true);
         });
-        const entries = {}
-        let currentEntryTitle = 'GM Background';
+    }
+
+
+    async createJournalItem(match, text, item, spell, monster, processedLine, itemFolder, monsterFolder, modulePath, originalText, missingRefs, defaultType, contextLine) {
+        const entity = item || spell || monster;
+        if (entity) {
+            if (item || spell) {
+                let entityType = entity.type.charAt(0).toUpperCase() + entity.type.slice(1);
+                let subfolder = await game.folders.find(f => f.name === entityType && f.type === "Item" && f.folder?.id === itemFolder.id);
+                if (!subfolder) subfolder = await Folder.create({ name: entityType, type: "Item", folder: itemFolder.id });
+
+                let entityData = entity.toObject();
+                entityData.folder = subfolder.id;
+
+                let importedEntity;
+                if (!game.items.find(f => f.name === text)) importedEntity = await Item.create(entityData);
+                else importedEntity = game.items.find(f => f.name === text);
+
+                processedLine = processedLine.replace(match[0], ` @UUID[Item.${importedEntity.id}]{${text}} `);
+            } else if (monster) {
+                let monsterData = monster.toObject();
+                monsterData.folder = monsterFolder.id;
+
+                let importedMonster;
+                if (!game.actors.find(f => f.name === text)) {
+                    importedMonster = await Actor.create(monsterData);
+                    if (modulePath) await this.createToken(importedMonster, text, modulePath);
+                } else {
+                    importedMonster = game.actors.find(f => f.name === text);
+                }
+
+                processedLine = processedLine.replace(match[0], ` @UUID[Actor.${importedMonster.id}]{${text}} `);
+            }
+        } else if (missingRefs) {
+            const placeholder = `@@MISSING_${foundry.utils.randomID()}@@`;
+            missingRefs.push({
+                placeholder,
+                linkText: (originalText ?? text) ?? "",
+                searchText: text ?? "",
+                defaultType: defaultType || "Item",
+                contextLine: contextLine ?? ""
+            });
+            processedLine = processedLine.replace(match[0], ` ${placeholder} `);
+        } else {
+            processedLine = processedLine.replace(match[0], text);
+        }
+        return processedLine;
+    }
+
+    async processJournalItems(line, monsterFolder, itemFolder, missingRefs) {
+        const regex = /\[(.*?)\]\((.*?)\)/g;
+        let match;
+        let processedLine = line;
+
+        const findByName = async (name) => {
+            const [item] = await game.packs.get("dnd5e.items").getDocuments({ name });
+            const [spell] = await game.packs.get("dnd5e.spells").getDocuments({ name });
+            const [monster] = await game.packs.get("dnd5e.monsters").getDocuments({ name });
+            return { item, spell, monster };
+        };
+
+        while ((match = regex.exec(line)) !== null) {
+            const originalText = match[1];
+
+            let text = originalText;
+            let { item, spell, monster } = await findByName(text);
+
+            if (!item && !spell && !monster) {
+                const singularText = await this.getSingularForm(originalText);
+                const found = await findByName(singularText);
+
+                if (found.item || found.spell || found.monster) {
+                    text = singularText;
+                    item = found.item;
+                    spell = found.spell;
+                    monster = found.monster;
+                } else {
+                    text = originalText;
+                    item = undefined;
+                    spell = undefined;
+                    monster = undefined;
+                }
+            }
+
+            const defaultType = monster ? "Actor" : "Item";
+
+            processedLine = await this.createJournalItem(
+                match,
+                text,
+                item,
+                spell,
+                monster,
+                processedLine,
+                itemFolder,
+                monsterFolder,
+                null,
+                originalText,
+                missingRefs,
+                defaultType,
+                line
+            );
+        }
+
+        return processedLine.replace("  ", " ");
+    }
+
+    async processJournalItemsPathfinder(line, monsterFolder, itemFolder, modulePath, missingRefs) {
+        const regex = /\[(.*?)\]\((.*?)\)/g;
+        let match;
+        let processedLine = line;
+
+        const findByName = async (name) => {
+            const [item] = await game.packs.get("pf2e.equipment-srd").getDocuments({ name });
+            const [spell] = await game.packs.get("pf2e.spells-srd").getDocuments({ name });
+            let monster;
+            if (!item && !spell) monster = await this.findMonsterPathfinder(name);
+            return { item, spell, monster };
+        };
+
+        while ((match = regex.exec(line)) !== null) {
+            const originalText = match[1];
+
+            let text = originalText;
+            let { item, spell, monster } = await findByName(text);
+
+            if (!item && !spell && !monster) {
+                const singularText = await this.getSingularForm(originalText);
+                const found = await findByName(singularText);
+
+                if (found.item || found.spell || found.monster) {
+                    text = singularText;
+                    item = found.item;
+                    spell = found.spell;
+                    monster = found.monster;
+                } else {
+                    text = originalText;
+                    item = undefined;
+                    spell = undefined;
+                    monster = undefined;
+                }
+            }
+
+            const defaultType = monster ? "Actor" : "Item";
+
+            processedLine = await this.createJournalItem(
+                match,
+                text,
+                item,
+                spell,
+                monster,
+                processedLine,
+                itemFolder,
+                monsterFolder,
+                modulePath,
+                originalText,
+                missingRefs,
+                defaultType,
+                line
+            );
+        }
+
+        return processedLine.replace("  ", " ");
+    }
+
+    async processJournals(journals, folder, monsters, monsterFolder, itemFolder, macro, musicList) {
+        journals = journals.join("\n").split("\n");
+        const mainJournal = await JournalEntry.create({ name: "Dungeon Design", folder: folder.id });
+
+        const entries = {};
+        const missingRefs = [];
+        let currentEntryTitle = "GM Background";
         let currentEntryLines = [];
 
         for (let line of journals) {
             const match = line.match(/^## (A\d{1,2}\. .+)/);
             if (match) {
-                if (currentEntryLines.length > 0) {
-                    entries[currentEntryTitle] = currentEntryLines.join('\n');
-                }
+                if (currentEntryLines.length > 0) entries[currentEntryTitle] = currentEntryLines.join("\n");
                 currentEntryTitle = match[1];
                 currentEntryLines = [];
                 continue;
             }
-            if (line.startsWith('## Aftermath')) {
-                entries[currentEntryTitle] = currentEntryLines.join('\n');
-                currentEntryTitle = 'Aftermath'
+            if (line.startsWith("## Aftermath")) {
+                entries[currentEntryTitle] = currentEntryLines.join("\n");
+                currentEntryTitle = "Aftermath";
                 currentEntryLines = [];
                 continue;
             }
-            if (/^[\\{}\[! ]/.test(line)) {
-                continue;
-            }
-            if (line.startsWith('## ')) {
-                line = `**${line.slice(3)}**`;
-            }
-            line = await this.processJournalItems(line, monsterFolder, itemFolder);
+            if (/^[\\{}\[! ]/.test(line)) continue;
+            if (line.startsWith("## ")) line = `**${line.slice(3)}**`;
+
+            line = await this.processJournalItems(line, monsterFolder, itemFolder, missingRefs);
             line = await this.processJournalMonsters(line, monsters);
 
             currentEntryLines.push(line);
         }
 
-        if (currentEntryLines.length > 0) {
-            entries[currentEntryTitle] = currentEntryLines.join('\n');
-        }
+        if (currentEntryLines.length > 0) entries[currentEntryTitle] = currentEntryLines.join("\n");
+
+        await this.resolveMissingReferences(entries, missingRefs, itemFolder, monsterFolder, null);
 
         const converter = new showdown.Converter();
         for (let [name, content] of Object.entries(entries)) {
             content = await this.addMusic(name, content, macro, musicList);
-            let contentConverted = converter.makeHtml(content);
-            await mainJournal.createEmbeddedDocuments('JournalEntryPage', [{name: name, "text.content": contentConverted, "text.format":CONST.JOURNAL_ENTRY_PAGE_FORMATS.HTML}])
+            const contentConverted = converter.makeHtml(content);
+            await mainJournal.createEmbeddedDocuments("JournalEntryPage", [{
+                name,
+                "text.content": contentConverted,
+                "text.format": CONST.JOURNAL_ENTRY_PAGE_FORMATS.HTML
+            }]);
         }
     }
 
     async processJournalsPathfinder(journals, folder, monsters, monsterFolder, itemFolder, macro, musicList, modulePath) {
-        journals = journals.join('\n').split('\n')
-        const mainJournal = await JournalEntry.create({
-            name: 'Dungeon Design',
-            folder: folder.id
-        });
-        const entries = {}
-        let currentEntryTitle = 'GM Background';
+        journals = journals.join("\n").split("\n");
+        const mainJournal = await JournalEntry.create({ name: "Dungeon Design", folder: folder.id });
+
+        const entries = {};
+        const missingRefs = [];
+        let currentEntryTitle = "GM Background";
         let currentEntryLines = [];
 
         for (let line of journals) {
             const match = line.match(/^## (A\d{1,2}\. .+)/);
             if (match) {
-                if (currentEntryLines.length > 0) {
-                    entries[currentEntryTitle] = currentEntryLines.join('\n');
-                }
+                if (currentEntryLines.length > 0) entries[currentEntryTitle] = currentEntryLines.join("\n");
                 currentEntryTitle = match[1];
                 currentEntryLines = [];
                 continue;
             }
-            if (line.startsWith('## Aftermath')) {
-                entries[currentEntryTitle] = currentEntryLines.join('\n');
-                currentEntryTitle = 'Aftermath'
+            if (line.startsWith("## Aftermath")) {
+                entries[currentEntryTitle] = currentEntryLines.join("\n");
+                currentEntryTitle = "Aftermath";
                 currentEntryLines = [];
                 continue;
             }
 
-            if (line.startsWith('{{paragraph ')) {
-                line = line.slice(12)
-            }
+            if (line.startsWith("{{paragraph ")) line = line.slice(12);
+            if (line.startsWith("{{line ")) line = line.slice(7);
+            if (line.endsWith("}}")) line = line.slice(0, -2);
+            if (line.startsWith("{{")) continue;
 
-            if (line.startsWith('{{line ')) {
-                line = line.slice(7)
-            }
+            if (line.startsWith("## ")) line = `**${line.slice(3)}**`;
 
-            if (line.endsWith('}}')) {
-                line = line.slice(0, -2);
-            }
-
-            if (line.startsWith('{{')) {
-                continue;
-            }
-
-            if (line.startsWith('## ')) {
-                line = `**${line.slice(3)}**`;
-            }
-            line = await this.processJournalItemsPathfinder(line, monsterFolder, itemFolder, modulePath);
+            line = await this.processJournalItemsPathfinder(line, monsterFolder, itemFolder, modulePath, missingRefs);
             line = await this.processJournalMonsters(line, monsters);
+
             currentEntryLines.push(line);
         }
 
-        if (currentEntryLines.length > 0) {
-            entries[currentEntryTitle] = currentEntryLines.join('\n');
-        }
+        if (currentEntryLines.length > 0) entries[currentEntryTitle] = currentEntryLines.join("\n");
+
+        await this.resolveMissingReferences(entries, missingRefs, itemFolder, monsterFolder, modulePath);
 
         const converter = new showdown.Converter();
         for (let [name, content] of Object.entries(entries)) {
             content = await this.addMusic(name, content, macro, musicList);
-            let contentConverted = converter.makeHtml(content);
-            await mainJournal.createEmbeddedDocuments('JournalEntryPage', [{name: name, "text.content": contentConverted, "text.format":CONST.JOURNAL_ENTRY_PAGE_FORMATS.HTML}])
+            const contentConverted = converter.makeHtml(content);
+            await mainJournal.createEmbeddedDocuments("JournalEntryPage", [{
+                name,
+                "text.content": contentConverted,
+                "text.format": CONST.JOURNAL_ENTRY_PAGE_FORMATS.HTML
+            }]);
         }
     }
 
