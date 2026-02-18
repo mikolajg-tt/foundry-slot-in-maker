@@ -733,50 +733,52 @@ class SessionForm extends FormApplication {
 
 
     async createJournalItem(match, text, item, spell, monster, processedLine, itemFolder, monsterFolder, modulePath, originalText, missingRefs, defaultType, contextLine) {
-        const entity = item || spell || monster;
-        if (entity) {
-            if (item || spell) {
-                let entityType = entity.type.charAt(0).toUpperCase() + entity.type.slice(1);
-                let subfolder = await game.folders.find(f => f.name === entityType && f.type === "Item" && f.folder?.id === itemFolder.id);
-                if (!subfolder) subfolder = await Folder.create({ name: entityType, type: "Item", folder: itemFolder.id });
+		const entity = item || spell || monster;
+		if (entity) {
+			if (item || spell) {
+				let entityType = entity.type.charAt(0).toUpperCase() + entity.type.slice(1);
+				let subfolder = await game.folders.find(f => f.name === entityType && f.type === "Item" && f.folder?.id === itemFolder.id);
+				if (!subfolder) subfolder = await Folder.create({ name: entityType, type: "Item", folder: itemFolder.id });
+				let entityData = entity.toObject();
+				entityData.folder = subfolder.id;
+				let importedEntity;
+				let existing = subfolder.contents.find(f => f.name === text);
+				if (!existing) {
+					importedEntity = await Item.create(entityData);
+				} else {
+					importedEntity = existing;
+				}
 
-                let entityData = entity.toObject();
-                entityData.folder = subfolder.id;
+				processedLine = processedLine.replace(match[0], ` @UUID[Item.${importedEntity.id}]{${text}} `);
+			} else if (monster) {
+				let monsterData = monster.toObject();
+				monsterData.folder = monsterFolder.id;
+				let importedMonster;
+				let existing = monsterFolder.contents.find(f => f.name === text);
+				if (!existing) {
+					importedMonster = await Actor.create(monsterData);
+					if (modulePath) await this.createToken(importedMonster, text, modulePath);
+				} else {
+					importedMonster = existing;
+				}
 
-                let importedEntity;
-                if (!game.items.find(f => f.name === text)) importedEntity = await Item.create(entityData);
-                else importedEntity = game.items.find(f => f.name === text);
-
-                processedLine = processedLine.replace(match[0], ` @UUID[Item.${importedEntity.id}]{${text}} `);
-            } else if (monster) {
-                let monsterData = monster.toObject();
-                monsterData.folder = monsterFolder.id;
-
-                let importedMonster;
-                if (!game.actors.find(f => f.name === text)) {
-                    importedMonster = await Actor.create(monsterData);
-                    if (modulePath) await this.createToken(importedMonster, text, modulePath);
-                } else {
-                    importedMonster = game.actors.find(f => f.name === text);
-                }
-
-                processedLine = processedLine.replace(match[0], ` @UUID[Actor.${importedMonster.id}]{${text}} `);
-            }
-        } else if (missingRefs) {
-            const placeholder = `@@MISSING_${foundry.utils.randomID()}@@`;
-            missingRefs.push({
-                placeholder,
-                linkText: (originalText ?? text) ?? "",
-                searchText: text ?? "",
-                defaultType: defaultType || "Item",
-                contextLine: contextLine ?? ""
-            });
-            processedLine = processedLine.replace(match[0], ` ${placeholder} `);
-        } else {
-            processedLine = processedLine.replace(match[0], text);
-        }
-        return processedLine;
-    }
+				processedLine = processedLine.replace(match[0], ` @UUID[Actor.${importedMonster.id}]{${text}} `);
+			}
+		} else if (missingRefs) {
+			const placeholder = `@@MISSING_${foundry.utils.randomID()}@@`;
+			missingRefs.push({
+				placeholder,
+				linkText: (originalText ?? text) ?? "",
+				searchText: text ?? "",
+				defaultType: defaultType || "Item",
+				contextLine: contextLine ?? ""
+			});
+			processedLine = processedLine.replace(match[0], ` ${placeholder} `);
+		} else {
+			processedLine = processedLine.replace(match[0], text);
+		}
+		return processedLine;
+	}
 
     async processJournalItems(line, monsterFolder, itemFolder, missingRefs) {
         const regex = /\[(.*?)\]\((.*?)\)/g;
