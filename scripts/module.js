@@ -2,21 +2,50 @@ import {sbiParser} from "../../5e-statblock-importer/scripts/sbiParser.js";
 import {DDImporter} from "../../foundry-vtt-module-maker/ddimport.js";
 import {sbiActor} from "../../5e-statblock-importer/scripts/sbiActor.js";
 
-class SessionForm extends FormApplication {
-    constructor(object = {}, options = {}) {
-        super(object, options);
+const { ApplicationV2, HandlebarsApplicationMixin, DialogV2 } = foundry.applications.api;
+const FilePickerImpl = foundry.applications.apps.FilePicker.implementation;
+
+class SessionForm extends HandlebarsApplicationMixin(ApplicationV2) {
+    static async _formHandler(event, form, formData) {
+        await this._processSubmit(formData.object);
     }
 
-    static get defaultOptions() {
-        return mergeObject(super.defaultOptions, {
-            id: 'session-form',
-            title: 'Slot-in Session',
-            template: 'modules/foundry-slot-in-maker/templates/sessionInput.html',
-            width: 1024,
-            closeOnSubmit: true,
-            submitOnClose: false,
+    static async _onBrowseFolder(event, target) {
+        const input = this.element.querySelector('#slotinFolder');
+        const fp = new FilePickerImpl({
+            type: 'folder',
+            current: input?.value ?? '',
+            callback: (path) => { if (input) input.value = path; }
         });
+        fp.render({ force: true });
     }
+
+    static DEFAULT_OPTIONS = {
+        id: 'session-form',
+        tag: 'form',
+        window: {
+            title: 'Slot-in Session',
+            resizable: true
+        },
+        position: {
+            width: 1024,
+            height: 'auto'
+        },
+        actions: {
+            browseFolder: this._onBrowseFolder
+        },
+        form: {
+            handler: this._formHandler,
+            closeOnSubmit: true,
+            submitOnChange: false
+        }
+    };
+
+    static PARTS = {
+        form: {
+            template: 'modules/foundry-slot-in-maker/templates/sessionInput.html'
+        }
+    };
 
     async createFolder(path, folderName, folderType) {
         let directory = path.split('/')[1].split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1));
@@ -47,11 +76,11 @@ class SessionForm extends FormApplication {
 
     async processMusic(folder, modulePath) {
         const musicFolderPath = `${modulePath}/Music`;
-        const musicFolders = await FilePicker.browse("data", musicFolderPath);
+        const musicFolders = await FilePickerImpl.browse("data", musicFolderPath);
         let playlist = game.playlists.contents.find(p => p.name === folder.name);
         let playlistsDict = {};
         for (const subFolder of musicFolders.dirs) {
-            const files = await FilePicker.browse("data", subFolder);
+            const files = await FilePickerImpl.browse("data", subFolder);
             if (files.files.length === 0) continue;
             let folderName = decodeURIComponent(subFolder.split('/').pop());
             folderName = folderName.includes("-") ? folderName.split("-")[0] : folderName;
@@ -116,7 +145,7 @@ class SessionForm extends FormApplication {
 
     async createToken(monsterActor, monsterName, modulePath) {
         const tokenFolderPath = `${modulePath}/Tokens`;
-        const tokenFiles = await FilePicker.browse("data", tokenFolderPath);
+        const tokenFiles = await FilePickerImpl.browse("data", tokenFolderPath);
         for (let file of tokenFiles.files) {
             const tokenName = decodeURIComponent(file.split('/').pop().split('.').shift());
             if (tokenName.toLowerCase() === monsterName.toLowerCase()) {
@@ -161,7 +190,7 @@ class SessionForm extends FormApplication {
     async processMonstersPathfinder(folder, modulePath) {
         const monsterList = [];
         const monsterFolderPath = `${modulePath}/Monsters`;
-        const monsterFiles = await FilePicker.browse("data", monsterFolderPath)
+        const monsterFiles = await FilePickerImpl.browse("data", monsterFolderPath)
         for (let monsterFile of monsterFiles.files) {
             const monsterData = await (await fetch(monsterFile)).text();
 
@@ -543,191 +572,200 @@ class SessionForm extends FormApplication {
 
         return await new Promise((resolve) => {
             let dd;
+            let resolved = false;
+            const safeResolve = (value) => {
+                if (resolved) return;
+                resolved = true;
+                resolve(value);
+            };
 
             const cleanup = () => {
                 if (dd && dd.parentElement) dd.parentElement.removeChild(dd);
                 dd = null;
             };
 
-            new Dialog(
-                {
-                    title: "Resolve missing references",
-                    content,
-                    render: (html) => {
-                        dd = makeDropdown();
+            const dialog = new DialogV2({
+                window: { title: "Resolve missing references", resizable: true },
+                position: { width: 2100, height: 1200 },
+                content,
+                buttons: [{
+                    action: "apply",
+                    label: "Apply",
+                    default: true,
+                    callback: (event, button, dlg) => {
+                        const root = dlg.element;
+                        const trs = Array.from(root.querySelectorAll("tbody tr"));
+                        const out = {};
 
-                        const root = html[0];
-                        const tbody = root.querySelector("tbody");
-                        const scrollEl = root.querySelector(".mr-scroll");
-
-                        const debounceMap = new WeakMap();
-
-                        const schedulePopulate = (tr) => {
-                            const existing = debounceMap.get(tr);
-                            if (existing) window.clearTimeout(existing);
-                            const t = window.setTimeout(() => populateRow(tr), 170);
-                            debounceMap.set(tr, t);
-                        };
-
-                        const populateRow = async (tr) => {
+                        for (const tr of trs) {
+                            const placeholder = tr.dataset.placeholder;
                             const type = tr.querySelector(".mr-type").value;
-                            const input = tr.querySelector(".mr-query");
-                            const picked = tr.querySelector(".mr-picked");
-                            const q = (input.value ?? "").trim();
+                            const picked = tr.querySelector(".mr-picked").value || "";
 
-                            picked.value = "";
-
-                            if (!q) {
-                                hideDropdown(dd);
-                                return;
-                            }
-
-                            dd._anchor = { tr, input };
-                            positionDropdown(dd, input);
-                            renderDropdown(dd, []);
-                            showDropdown(dd);
-
-                            const hits = await this.searchCompendiumContent(type, q, 10);
-                            if (!dd._anchor || dd._anchor.tr !== tr) return;
-
-                            positionDropdown(dd, input);
-                            renderDropdown(dd, hits);
-                            showDropdown(dd);
-                        };
-
-                        const applyPick = (tr, val, name) => {
-                            const input = tr.querySelector(".mr-query");
-                            const picked = tr.querySelector(".mr-picked");
-                            input.value = name || "";
-                            picked.value = val || "";
-                            hideDropdown(dd);
-                        };
-
-                        tbody.addEventListener("input", (ev) => {
-                            const tr = ev.target.closest("tr");
-                            if (!tr) return;
-                            if (ev.target.classList.contains("mr-query")) schedulePopulate(tr);
-                        });
-
-                        tbody.addEventListener("focusin", (ev) => {
-                            const tr = ev.target.closest("tr");
-                            if (!tr) return;
-                            if (ev.target.classList.contains("mr-query")) schedulePopulate(tr);
-                        });
-
-                        tbody.addEventListener("change", (ev) => {
-                            const tr = ev.target.closest("tr");
-                            if (!tr) return;
-
-                            if (ev.target.classList.contains("mr-type")) {
-                                const input = tr.querySelector(".mr-query");
-                                const picked = tr.querySelector(".mr-picked");
-                                input.value = "";
-                                picked.value = "";
-                                hideDropdown(dd);
-                            }
-                        });
-
-                        tbody.addEventListener("click", (ev) => {
-                            const tr = ev.target.closest("tr");
-                            if (!tr) return;
-
-                            if (ev.target.closest(".mr-text")) {
-                                const ph = tr.dataset.placeholder;
-                                const m = missingRefs.find(x => x.placeholder === ph) ?? null;
-                                const htmlCtx = buildContextHtml(m?.contextLine ?? "", m?.linkText ?? "");
-                                new Dialog(
-                                    {
-                                        title: "Context",
-                                        content: `<div style="padding: 6px 0; color: #000000;"><div style="white-space: pre-wrap; word-break: break-word; margin: 0; padding: 10px; border: 1px solid #d9d9d9; border-radius: 6px; background: #ffffff; color: #000000;">${htmlCtx}</div></div>`,
-                                        buttons: { ok: { label: "OK" } },
-                                        default: "ok"
-                                    },
-                                    { width: 1200, height: 450, resizable: true }
-                                ).render(true);
-                                return;
-                            }
-                        });
-
-                        dd.addEventListener("mousemove", (ev) => {
-                            const opt = ev.target.closest(".mr-opt");
-                            if (!opt) return;
-                            for (const child of dd.children) child.style.background = "#ffffff";
-                            opt.style.background = "#f2f2f2";
-                        });
-
-                        dd.addEventListener("mousedown", (ev) => {
-                            const opt = ev.target.closest(".mr-opt");
-                            if (!opt) return;
-                            const anchor = dd._anchor;
-                            if (!anchor?.tr) return;
-                            applyPick(anchor.tr, opt.dataset.val || "", opt.dataset.name || "");
-                        });
-
-                        const repositionIfOpen = () => {
-                            if (!dd._anchor?.input) return;
-                            positionDropdown(dd, dd._anchor.input);
-                        };
-
-                        scrollEl?.addEventListener("scroll", () => {
-                            if (dd.style.display === "none") return;
-                            repositionIfOpen();
-                        });
-
-                        window.addEventListener("scroll", repositionIfOpen, true);
-
-                        root.addEventListener("mousedown", (ev) => {
-                            const inDialog = root.contains(ev.target);
-                            const inDd = dd.contains(ev.target);
-                            if (!inDialog || inDd) return;
-
-                            const inInput = ev.target.closest(".mr-query");
-                            if (inInput) return;
-
-                            hideDropdown(dd);
-                        });
-
-                        root._mrCleanup = () => {
-                            window.removeEventListener("scroll", repositionIfOpen, true);
-                        };
-                    },
-                    buttons: {
-                        apply: {
-                            label: "Apply",
-                            callback: (html) => {
-                                const root = html[0];
-                                const trs = Array.from(root.querySelectorAll("tbody tr"));
-                                const out = {};
-
-                                for (const tr of trs) {
-                                    const placeholder = tr.dataset.placeholder;
-                                    const type = tr.querySelector(".mr-type").value;
-                                    const picked = tr.querySelector(".mr-picked").value || "";
-
-                                    if (picked) {
-                                        const [collection, id] = picked.split("|");
-                                        out[placeholder] = { type, collection, id };
-                                    } else {
-                                        out[placeholder] = { type, collection: null, id: null };
-                                    }
-                                }
-
-                                resolve(out);
+                            if (picked) {
+                                const [collection, id] = picked.split("|");
+                                out[placeholder] = { type, collection, id };
+                            } else {
+                                out[placeholder] = { type, collection: null, id: null };
                             }
                         }
-                    },
-                    default: "apply",
-                    close: (html) => {
-                        try {
-                            const root = html?.[0];
-                            if (root?._mrCleanup) root._mrCleanup();
-                        } catch (e) {}
-                        cleanup();
-                        resolve(null);
+
+                        safeResolve(out);
+                        return out;
                     }
-                },
-                { width: 2100, height: 1200, resizable: true }
-            ).render(true);
+                }],
+                submit: () => {},
+                rejectClose: false
+            });
+
+            const setupRender = () => {
+                dd = makeDropdown();
+
+                const root = dialog.element;
+                const tbody = root.querySelector("tbody");
+                const scrollEl = root.querySelector(".mr-scroll");
+
+                const debounceMap = new WeakMap();
+
+                const schedulePopulate = (tr) => {
+                    const existing = debounceMap.get(tr);
+                    if (existing) window.clearTimeout(existing);
+                    const t = window.setTimeout(() => populateRow(tr), 170);
+                    debounceMap.set(tr, t);
+                };
+
+                const populateRow = async (tr) => {
+                    const type = tr.querySelector(".mr-type").value;
+                    const input = tr.querySelector(".mr-query");
+                    const picked = tr.querySelector(".mr-picked");
+                    const q = (input.value ?? "").trim();
+
+                    picked.value = "";
+
+                    if (!q) {
+                        hideDropdown(dd);
+                        return;
+                    }
+
+                    dd._anchor = { tr, input };
+                    positionDropdown(dd, input);
+                    renderDropdown(dd, []);
+                    showDropdown(dd);
+
+                    const hits = await this.searchCompendiumContent(type, q, 10);
+                    if (!dd._anchor || dd._anchor.tr !== tr) return;
+
+                    positionDropdown(dd, input);
+                    renderDropdown(dd, hits);
+                    showDropdown(dd);
+                };
+
+                const applyPick = (tr, val, name) => {
+                    const input = tr.querySelector(".mr-query");
+                    const picked = tr.querySelector(".mr-picked");
+                    input.value = name || "";
+                    picked.value = val || "";
+                    hideDropdown(dd);
+                };
+
+                tbody.addEventListener("input", (ev) => {
+                    const tr = ev.target.closest("tr");
+                    if (!tr) return;
+                    if (ev.target.classList.contains("mr-query")) schedulePopulate(tr);
+                });
+
+                tbody.addEventListener("focusin", (ev) => {
+                    const tr = ev.target.closest("tr");
+                    if (!tr) return;
+                    if (ev.target.classList.contains("mr-query")) schedulePopulate(tr);
+                });
+
+                tbody.addEventListener("change", (ev) => {
+                    const tr = ev.target.closest("tr");
+                    if (!tr) return;
+
+                    if (ev.target.classList.contains("mr-type")) {
+                        const input = tr.querySelector(".mr-query");
+                        const picked = tr.querySelector(".mr-picked");
+                        input.value = "";
+                        picked.value = "";
+                        hideDropdown(dd);
+                    }
+                });
+
+                tbody.addEventListener("click", (ev) => {
+                    const tr = ev.target.closest("tr");
+                    if (!tr) return;
+
+                    if (ev.target.closest(".mr-text")) {
+                        const ph = tr.dataset.placeholder;
+                        const m = missingRefs.find(x => x.placeholder === ph) ?? null;
+                        const htmlCtx = buildContextHtml(m?.contextLine ?? "", m?.linkText ?? "");
+                        new DialogV2({
+                            window: { title: "Context", resizable: true },
+                            position: { width: 1200, height: 450 },
+                            content: `<div style="padding: 6px 0; color: #000000;"><div style="white-space: pre-wrap; word-break: break-word; margin: 0; padding: 10px; border: 1px solid #d9d9d9; border-radius: 6px; background: #ffffff; color: #000000;">${htmlCtx}</div></div>`,
+                            buttons: [{ action: "ok", label: "OK", default: true }],
+                            submit: () => {},
+                            rejectClose: false
+                        }).render({ force: true });
+                        return;
+                    }
+                });
+
+                dd.addEventListener("mousemove", (ev) => {
+                    const opt = ev.target.closest(".mr-opt");
+                    if (!opt) return;
+                    for (const child of dd.children) child.style.background = "#ffffff";
+                    opt.style.background = "#f2f2f2";
+                });
+
+                dd.addEventListener("mousedown", (ev) => {
+                    const opt = ev.target.closest(".mr-opt");
+                    if (!opt) return;
+                    const anchor = dd._anchor;
+                    if (!anchor?.tr) return;
+                    applyPick(anchor.tr, opt.dataset.val || "", opt.dataset.name || "");
+                });
+
+                const repositionIfOpen = () => {
+                    if (!dd._anchor?.input) return;
+                    positionDropdown(dd, dd._anchor.input);
+                };
+
+                scrollEl?.addEventListener("scroll", () => {
+                    if (dd.style.display === "none") return;
+                    repositionIfOpen();
+                });
+
+                window.addEventListener("scroll", repositionIfOpen, true);
+
+                root.addEventListener("mousedown", (ev) => {
+                    const inDialog = root.contains(ev.target);
+                    const inDd = dd.contains(ev.target);
+                    if (!inDialog || inDd) return;
+
+                    const inInput = ev.target.closest(".mr-query");
+                    if (inInput) return;
+
+                    hideDropdown(dd);
+                });
+
+                root._mrCleanup = () => {
+                    window.removeEventListener("scroll", repositionIfOpen, true);
+                };
+            };
+
+            dialog.addEventListener("close", () => {
+                try {
+                    const root = dialog.element;
+                    if (root?._mrCleanup) root._mrCleanup();
+                } catch (e) {}
+                cleanup();
+                safeResolve(null);
+            });
+
+            dialog.render({ force: true }).then(() => setupRender());
         });
     }
 
@@ -996,7 +1034,7 @@ class SessionForm extends FormApplication {
         }
     }
 
-    async _updateObject(event, formData) {
+    async _processSubmit(formData) {
         if (formData.gameSystem === '') {
             return;
         }
@@ -1025,11 +1063,6 @@ class SessionForm extends FormApplication {
         }
 
         await this.processMaps(sceneFolder, formData.path);
-
-    }
-
-    activateListeners(html) {
-        super.activateListeners(html);
     }
 }
 
